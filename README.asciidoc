@@ -70,6 +70,7 @@ cat ?file? | ./dokuwiki-tool -d -v teq https://dokuwiki.concurrent.co.za/doku.ph
 == How To Use Git
 
 Init:
+
 ----
 touch README.md
 git init
@@ -80,6 +81,14 @@ git config user.name "Iwan Aucamp"
 git remote add origin https://github.com/aucampia/dokuwiki-tool.git
 git push -u origin master
 ----
+
+Change URI:
+
+----
+git remote set-url origin git@github.com:aucampia/dokuwiki-tool.git
+----
+
+Other:
 
 ----
 git pull
