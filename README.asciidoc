@@ -1,0 +1,88 @@
+= DokuWiki Tool
+
+== Prerequisites
+
+* Python 3 [3.2 was used for testing]
+
+== Usage
+
+----
+$ ./dokuwiki-tool -h
+Usage: dokuwiki-tool [options] command ...
+
+Options:
+  --version             show program's version number and exit
+  -h, --help            
+  -v, --verbose         increase verbosity level
+  -u USERNAME, --username=USERNAME
+                        Username for dokuwiki
+  -p PASSWORD, --password=PASSWORD
+                        Password for dokuwiki
+  -U HTTP_USERNAME, --http-username=HTTP_USERNAME
+                        Username for http
+  -P HTTP_PASSWORD, --http-password=HTTP_PASSWORD
+                        Password for http
+  -m MESSAGE, --message=MESSAGE
+                        Specify commit message
+  -e EDITOR, --editor=EDITOR
+                        Specify editor
+  -c, --cleanup         Cleanup files
+  -D COOKIE_JAR_FILE, --cookie-jar-file=COOKIE_JAR_FILE
+                        Cookie jar file
+  -d, --cookie-jar      Cookie jar
+
+Commands:
+  dokuwiki-tool [options] cat url...
+                        pipe content to stdout ...
+  dokuwiki-tool [options] teq url...
+                        write stdin to url ...
+  dokuwiki-tool [options] edit url
+                        open url with $EDITOR ...
+
+Workflow example:
+  dokuwiki-tool -v -d -u ?username? -p ?password? login https://dokuwiki.concurrent.co.za/doku.php?id=sandbox
+  dokuwiki-tool -v -d -c edit https://dokuwiki.concurrent.co.za/doku.php?id=sandbox
+
+Notes:
+  * if you dont trust this tool dont use -c ... that way your changes are saved in directory that you ran this tool from.
+  * dont specify login/password after initial login inf cookie-jar is used.
+  * etc ...
+----
+
+== More Examples
+
+WorkFlow:
+
+----
+# Login
+./dokuwiki-tool -d -v -u ?username? -p ?password? login https://dokuwiki.concurrent.co.za/doku.php?id=x12
+
+# Edit File
+./dokuwiki-tool -c -d -v edit https://dokuwiki.concurrent.co.za/doku.php?id=x12
+
+# Cat File
+./dokuwiki-tool -d -v cat https://dokuwiki.concurrent.co.za/doku.php?id=x12
+
+# Uncat File (same as tee, just doesnt output to stdout...)
+cat ?file? | ./dokuwiki-tool -d -v teq https://dokuwiki.concurrent.co.za/doku.php?id=x12
+----
+
+== How To Use Git
+
+Init:
+----
+touch README.md
+git init
+git add README.md
+git commit -m "first commit"
+git config user.email "aucampia@gmail.com"
+git config user.name "Iwan Aucamp"
+git remote add origin https://github.com/aucampia/dokuwiki-tool.git
+git push -u origin master
+----
+
+----
+git pull
+git push
+----
+

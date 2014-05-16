@@ -1,0 +1,709 @@
+#!/usr/bin/env python3
+
+import os
+import datetime
+import copy
+import inspect
+import io
+import sys
+import optparse
+import urllib.parse
+import urllib.request
+import urllib.response
+import lxml.etree
+import http.client
+import http.cookiejar
+import subprocess
+import random
+import string
+import hashlib
+import socket
+import base64
+
+program_name="dokuwiki-tool"
+program_version="0.0.1"
+
+def random_string( *, size = 6, chars = string.ascii_letters + string.digits ):
+	return ''.join( random.choice( chars ) for x in range( size ) )
+	
+
+class NoRedirection( urllib.request.HTTPErrorProcessor ):
+	def http_response( self, request, response ):
+		verbose_write( 1, "response.code = [{}]\n".format( response.code ) )
+		if 300 <= response.code < 400 :
+			verbose_write( 1, "return response ...\n".format( response ) )
+			return response
+		verbose_write( 1, "super.http_response( {}, {} ) ...\n".format( request, response ) )
+		return super( NoRedirection, self ).http_response( request, response )
+	https_response = http_response
+
+class NoRedirectHandler( urllib.request.HTTPRedirectHandler ):
+	def http_error_300( self, req, fp, code, msg, headers ):
+		infourl = urllib.response.addinfourl( fp, headers, req.get_full_url() )
+		infourl.status = code
+		infourl.code = code
+		return infourl
+	http_error_301 = http_error_300
+	http_error_302 = http_error_300
+	http_error_303 = http_error_300
+	http_error_307 = http_error_300
+
+class DokuwikiUrl:
+	def __init__( self, url ):
+		url_parsed = urllib.parse.urlparse( url )
+		verbose_write( 1, "url_parsed = [{}]\n".format( url_parsed ) )
+		verbose_write( 1, "url_parsed.username = [{}]\n".format( url_parsed.username ) )
+		verbose_write( 1, "url_parsed.password = [{}]\n".format( url_parsed.password ) )
+		verbose_write( 1, "url_parsed.hostname = [{}]\n".format( url_parsed.hostname ) )
+		verbose_write( 1, "url_parsed.port = [{}]\n".format( url_parsed.port ) )
+
+		self.path = url_parsed.path
+		self.scheme = url_parsed.scheme
+		self.hostname = url_parsed.hostname
+		if url_parsed.username is not None:
+			self.username = urllib.parse.unquote( url_parsed.username )
+		else:
+			self.username = None
+		if url_parsed.password is not None:
+			self.password = urllib.parse.unquote( url_parsed.password )
+		else:
+			self.password = None
+		self.port = url_parsed.port
+
+		qs_parsed = urllib.parse.parse_qs( url_parsed.query )
+		verbose_write( 1, "qs_parsed = [{}]\n".format( qs_parsed ) )
+		if "id" in qs_parsed:
+			self.page_id = qs_parsed["id"][0]
+		else:
+			self.page_id = None
+		verbose_write( 1, "page_id = [{}]\n".format( self.page_id ) )
+		if "do" in qs_parsed:
+			self.do = qs_parsed["do"][0]
+		else:
+			self.do = None
+		if "rev" in qs_parsed:
+			self.rev = qs_parsed["rev"][0]
+		else:
+			self.rev = 0
+		verbose_write( 1, "do = [{}]\n".format( self.do ) )
+	
+	def site_url( self ):
+		return "{}://{}/{}".format( self.scheme, self.hostname, self.path )
+
+	def page_url( self, *, page_id = None, rev = None ):
+		if rev is None:
+			rev = self.rev;
+		if page_id is None:
+			page_id = self.page_id
+		if self.page_id is None:
+			raise RuntimeError( "purl=...: no page id" )
+		return self.site_url() + "?id={}&rev={}".format( page_id, rev )
+		
+		
+class DokuwikiSites:
+	def __init__( self, *, username = None, password = None, http_username = None, http_password = None, cookie_file = None ):
+		self.site_map = {};
+		self.cookie_file = cookie_file
+		if cookie_file is not None:
+			self.cookiejar = http.cookiejar.LWPCookieJar( cookie_file )
+			if os.path.isfile( cookie_file ):
+				self.cookiejar.load();
+		else:
+			self.cookiejar = http.cookiejar.CookieJar()
+		self.username = username
+		self.password = password
+		self.http_username = http_username
+		self.http_password = http_password
+		verbose_write( 1, "username = [{}]\n".format( self.username ) )
+		verbose_write( 1, "password = [{}]\n".format( self.password ) )
+		verbose_write( 1, "http_username = [{}]\n".format( self.http_username ) )
+		verbose_write( 1, "http_password = [{}]\n".format( self.http_password ) )
+		return
+
+	def save_cookies( self ):
+		if self.cookie_file:
+			self.cookiejar.save()
+		return
+
+	def get_site( self, *, durl = None, url = None ):
+		if url is not None:
+			durl = DokuwikiUrl( url )
+		key = durl.site_url()
+		if key in self.site_map:
+			verbose_write( 1, "return self.site_map[ {} ]\n".format( key ) )
+			return self.site_map[ key ]
+		else:
+			verbose_write( 1, "self.site_map[ {} ] = DokuwikiSite( self, {} )\n".format( key, key ) )
+			self.site_map[ key ] = DokuwikiSite( self, durl=durl )
+			verbose_write( 1, "return self.site_map[ {} ]\n".format( key ) )
+			return self.site_map[ key ]
+
+	def get_page( self, *, durl = None, url = None ):
+		if url is not None:
+			durl = DokuwikiUrl( url )
+		return self.get_site( durl = durl ).get_page( durl = durl )
+
+	def get_page_rev( self, *, durl = None, url = None ):
+		if url is not None:
+			durl = DokuwikiUrl( url )
+		return self.get_page( durl = durl ).get_rev( durl = durl )
+
+class DokuwikiSite:
+	def __init__( self, sites, *, url = None, durl = None ):
+		self.sites = sites
+		if url is not None:
+			self.durl = DokuwikiUrl( url )
+		else:
+			self.durl = durl
+		self.logged_in = False
+		#self.cookiejar = http.cookiejar.CookieJar()
+		#self.opener = urllib.request.build_opener( urllib.request.HTTPCookieProcessor( self.cookiejar ), NoRedirection() )
+		self.opener = urllib.request.build_opener( urllib.request.HTTPCookieProcessor( self.sites.cookiejar ), NoRedirection() )
+		self.page_map = {}
+	
+	def http_username( self, *, pref = None ):
+		http_username = pref
+		verbose_write( 1, "http_username = [{}]\n".format( http_username ) )
+		verbose_write( 1, "self.durl.username = [{}]\n".format( self.durl.username ) )
+		verbose_write( 1, "self.sites.http_username = [{}]\n".format( self.sites.http_username ) )
+		if http_username is None:
+			if self.durl.username is None:
+				if self.sites.http_username is None:
+					http_username = None
+				else:
+					http_username = self.sites.http_username
+			else:
+				http_username = self.durl.username
+		return http_username
+		
+	def http_password( self, *, pref = None ):
+		http_password = pref
+		verbose_write( 1, "http_password = [{}]\n".format( http_password ) )
+		verbose_write( 1, "self.durl.password = [{}]\n".format( self.durl.password ) )
+		verbose_write( 1, "self.sites.http_password = [{}]\n".format( self.sites.http_password ) )
+		if http_password is None:
+			if self.durl.password is None:
+				if self.sites.http_password is None:
+					http_password = None
+				else:
+					http_password = self.sites.http_password
+			else:
+				http_password = self.durl.password
+		return http_password
+
+	def username( self, *, pref = None ):
+		username = pref
+		verbose_write( 1, "username = [{}]\n".format( username ) )
+		verbose_write( 1, "self.sites.username = [{}]\n".format( self.sites.username ) )
+		if username is None:
+			if self.sites.username is None:
+				username = None
+			else:
+				username = self.sites.username
+		return username
+		
+	def password( self, *, pref = None ):
+		password = pref
+		verbose_write( 1, "password = [{}]\n".format( password ) )
+		verbose_write( 1, "self.sites.password = [{}]\n".format( self.sites.password ) )
+		if password is None:
+			if self.sites.password is None:
+				password = None
+			else:
+				password = self.sites.password
+		return password
+
+	def login( self, username = None, password = None ):
+		username = self.username( pref = username )
+		password = self.password( pref = password )
+
+		verbose_write( 1, "logged_in = [{}]\n".format( self.logged_in ) )
+		verbose_write( 1, "username = [{}]\n".format( username ) )
+		verbose_write( 1, "password = [{}]\n".format( password ) )
+
+		if ( not self.logged_in ) and ( username is not None ):
+            
+            
+			request = urllib.request.Request( self.durl.site_url() + "?do=login" )
+			#response = urllib.request.urlopen( request )
+			response = self.urlopen( request, login = False )
+			response_data = response.read()
+			verbose_write( 1, "response.status = [{}]\n".format( response.status ) )
+			verbose_write( 2, "response.reason = [{}]\n".format( response.reason ) )
+			verbose_write( 2, "response.read() = [{}]\n".format( response_data ) )
+			verbose_write( 2, "response.getheaders() = [{}]\n".format( response.getheaders() ) )
+			if response.status != 200:
+				raise RuntimeError( "site={}: sectok retrieval failed".format( self.durl.site_url() ) )
+            
+			parser = lxml.etree.XMLParser( remove_blank_text=True, resolve_entities=True )
+			etree = lxml.etree.parse( io.BytesIO( response_data ), parser )
+			root = etree.getroot();
+            
+			verbose_write( 2, "root.nsmap = [{}]\n".format( root.nsmap ) )
+			sectok_path = ".//form[@id='dw__login']/div[@class='no']/input[@name='sectok']"
+			sectok_element = root.find( sectok_path )
+			if sectok_element is None:
+				raise RuntimeError( "site={}: sectok retrieval failed".format( self.durl.site_url() ) )
+			verbose_write( 2, "sectok_element = [{}]\n".format( lxml.etree.tostring( sectok_element, pretty_print=True ) ) )
+			sectok = sectok_element.attrib[ "value" ]
+			verbose_write( 1, "sectok = [{}]\n".format( sectok ) )
+            
+			form_data_map = {
+				"sectok": sectok,
+				#"id": "start",
+				"do": "login",
+				"u": username,
+				"p": password,
+				"r": "1"
+			}
+			
+			form_data = urllib.parse.urlencode( form_data_map );
+			verbose_write( 2, "form_data = [{}]\n".format( form_data ) )
+            
+			request = urllib.request.Request( self.durl.site_url() + "?do=login", form_data.encode( "utf-8" ) )
+			#request.add_header( "Referer", self.durl.site_url() + "?do=login" );
+			verbose_write( 2, "request.header_items() = [{}]\n".format( request.header_items() ) )
+			response = self.urlopen( request, login = False )
+			response_data = response.read()
+			verbose_write( 1, "response.status = [{}]\n".format( response.status ) )
+			verbose_write( 2, "response.reason = [{}]\n".format( response.reason ) )
+			verbose_write( 2, "response.read() = [{}]\n".format( response_data ) )
+			verbose_write( 2, "response.getheaders() = [{}]\n".format( response.getheaders() ) )
+			if not ( 300 <= response.status < 400 ):
+				raise RuntimeError( "site={}: login failed".format( self.durl.site_url() ) )
+            
+			self.logged_in = True
+			self.sites.save_cookies();
+		return
+
+	def urlopen( self, url, *, login=True, data=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT ):
+		if login:
+			self.login();
+		http_username = self.http_username();
+		http_password = self.http_password();
+		if http_password is not None:
+			base64string = base64.b64encode( "{}:{}".format( http_username, http_password ).replace("\n", "" ).encode( "ascii" ) )
+			url.add_header( "Authorization", "Basic {}".format( base64string.decode( "ascii" ) ) )
+		return self.opener.open( url, data, timeout );
+
+	def get_page( self, *, url = None, durl = None, page_id = None, rev = None ):
+		if url is not None:
+			durl = DokuwikiUrl( url )
+		if durl is None:
+			durl = self.durl
+
+		if ( url is None ) and ( ( page_id is not None ) or ( rev is not None ) ):
+			## did not make it, dont break it
+			durl = copy.copy( self.durl )
+
+		if page_id is not None:
+			durl.page_id = page_id
+
+		if rev is not None:
+			durl.rev = rev
+
+		key = durl.page_url()
+
+		if key in self.page_map:
+			verbose_write( 1, "return self.page_map[ {} ]\n".format( key ) )
+			return self.page_map[ key ]
+		else:
+			verbose_write( 1, "self.page_map[ {} ] = DokuwikiPage( self, {} )\n".format( key, durl.page_url() ) )
+			self.page_map[ key ] = DokuwikiPage( self, durl=durl )
+			verbose_write( 1, "return self.page_map[ {} ]\n".format( key ) )
+			return self.page_map[ key ]
+			
+
+class DokuwikiPage:
+	def __init__( self, site, *, durl=None, url=None ):
+		self.site = site 
+		if url is not None:
+			self.durl = DokuwikiUrl( url )
+		else:
+			self.durl = durl
+		self.rev_map = {}
+
+	def get_rev( self, *, url = None, durl = None, rev = None ):
+		if url is not None:
+			durl = DokuwikiUrl( url )
+		if durl is None:
+			durl = self.durl
+
+		if ( url is None ) and ( rev is not None ):
+			## did not make it, dont break it
+			durl = copy.copy( self.durl )
+
+		if rev is not None:
+			durl.rev = rev
+
+		key = durl.page_url()
+
+		if key in self.rev_map:
+			verbose_write( 1, "return self.rev_map[ {} ]\n".format( key ) )
+			return self.rev_map[ key ]
+		else:
+			verbose_write( 1, "self.rev_map[ {} ] = DokuwikiPage( self, {} )\n".format( key, durl.page_url() ) )
+			self.rev_map[ key ] = DokuwikiPageRev( self, durl=durl )
+			verbose_write( 1, "return self.rev_map[ {} ]\n".format( key ) )
+			return self.rev_map[ key ]
+
+	def set_data( self, *, data = None, data_bin = None, filename = None, message = None ):
+		rev = self.get_rev( rev = 0 )
+		rev.get_data()
+
+		if filename is not None:
+			fh = open( filename, mode = "br", buffering = 0 );
+			data_bin = fh.read()
+			fh.close()
+
+		if data is None and data_bin is not None:
+			data = data_bin.decode( "utf-8" );
+			
+		if data_bin is None and data is not None:
+			data_bin = data.encode( "utf-8" );
+
+		if message is None:
+			message = "";
+	
+		form_data_map = {
+			"sectok": rev.sectok,
+			"id": self.durl.page_id,
+			"rev": "0",
+			"date": datetime.datetime.now().strftime("%s"),
+			"prefix": ".",
+			"suffix": "",
+			"changecheck": rev.changecheck,
+			"target": "section",
+			"wikitext": data,
+			"do[save]": "Save",
+			"summary": message
+		}
+		
+		form_data = urllib.parse.urlencode( form_data_map );
+		verbose_write( 1, "form_data = [{}]\n".format( form_data ) )
+
+		request = urllib.request.Request( self.durl.site_url() + "?do=login", form_data.encode( "utf-8" ) )
+		verbose_write( 2, "request.header_items() = [{}]\n".format( request.header_items() ) )
+		response = self.site.urlopen( request )
+		response_data = response.read()
+		verbose_write( 1, "response.status = [{}]\n".format( response.status ) )
+		verbose_write( 2, "response.reason = [{}]\n".format( response.reason ) )
+		verbose_write( 2, "response.read() = [{}]\n".format( response_data ) )
+		verbose_write( 2, "response.getheaders() = [{}]\n".format( response.getheaders() ) )
+		if not ( 300 <= response.status < 400 ):
+			raise RuntimeError( "site={}: login failed".format( self.durl.site_url() ) )
+
+		rev.set_data( data = data, data_bin = data_bin, sync = False, update = True )
+
+		return
+
+
+class DokuwikiPageRev:
+	def __init__( self, page, *, url = None, durl = None ):
+		self.page = page;
+		if url is not None:
+			self.durl = DokuwikiUrl( url )
+		else:
+			self.durl = durl
+		self.fetched = False
+
+	def get_data( self, *, refresh = False, binary = False ):
+		if ( not self.fetched ) or refresh:
+			request = urllib.request.Request( self.durl.page_url() + "&do=edit" )
+			verbose_write( 2, "request.full_url = [{}]\n".format( request.full_url ) )
+			verbose_write( 2, "request.header_items() = [{}]\n".format( request.header_items() ) )
+			response = self.page.site.urlopen( request )
+			response_data = response.read()
+			verbose_write( 1, "response.status = [{}]\n".format( response.status ) )
+			verbose_write( 2, "response.reason = [{}]\n".format( response.reason ) )
+			verbose_write( 2, "response.read() = [{}]\n".format( response_data ) )
+			verbose_write( 2, "response.getheaders() = [{}]\n".format( response.getheaders() ) )
+			if response.status != 200:
+				raise RuntimeError( "site={}: sectok retrieval failed".format( self.durl.site_url() ) )
+            
+			parser = lxml.etree.XMLParser( remove_blank_text=True, resolve_entities=True )
+			etree = lxml.etree.parse( io.BytesIO( response_data ), parser )
+			root = etree.getroot();
+            
+			verbose_write( 2, "root.nsmap = [{}]\n".format( root.nsmap ) )
+			#editform_path = ".//form[@id='dw__editform']/div[@class='no']/textarea[@name='wikitext']"
+			editform_path = ".//form[@id='dw__editform']/div[@class='no']"
+			editform_element = root.find( editform_path )
+			if editform_element is None:
+				raise RuntimeError( "site={}: editform retrieval failed".format( self.durl.site_url() ) )
+			verbose_write( 2, "editform_element = [{}]\n".format( lxml.etree.tostring( editform_element, pretty_print=True ) ) )
+
+			for child in editform_element:
+				verbose_write( 2, "child.tag = [{}]\n".format( child.tag ) )
+				if child.tag == "input":
+					input_name = child.attrib.get( "name", "INVALID" )
+					if input_name == "sectok":
+						self.sectok = child.attrib[ "value" ];
+					elif input_name == "changecheck":
+						self.changecheck = child.attrib[ "value" ];
+					elif input_name == "date":
+						self.date = child.attrib[ "value" ];
+					elif input_name == "rev":
+						self.rev = child.attrib[ "value" ];
+				elif child.tag == "textarea":
+					if child.text[0] == "\n":
+						self.data = child.text[1:]
+					else:
+						self.data = child.text
+					self.data_bin = self.data.encode( "utf-8" )
+					self.sha1 = hashlib.sha1( self.data_bin )
+
+			verbose_write( 1, "sectok = [{}]\n".format( self.sectok ) )
+			verbose_write( 1, "changecheck = [{}]\n".format( self.changecheck ) )
+			verbose_write( 1, "date = [{}]\n".format( self.date ) )
+			verbose_write( 1, "rev = [{}]\n".format( self.rev ) )
+			verbose_write( 1, "data = [{}]\n".format( self.data ) )
+			verbose_write( 1, "sha1 = [{}]\n".format( self.sha1 ) )
+
+			#sectok_path = ".//form[@id='dw__login']/div[@class='no']/input[@name='sectok']"
+			#sectok_element = root.find( sectok_path )
+			#if sectok_element is None:
+			#	raise RuntimeError( "site={}: sectok retrieval failed".format( self.durl.site_url() ) )
+			#verbose_write( 2, "sectok_element = [{}]\n".format( lxml.etree.tostring( sectok_element, pretty_print=True ) ) )
+			#sectok = sectok_element.attrib[ "value" ]
+			#verbose_write( 1, "sectok = [{}]\n".format( sectok ) )
+
+			self.fetched = True
+
+		if binary:
+			return self.data_bin;
+		else:
+			return self.data;
+
+	def tmp_filename( self, *, location = None ):
+		self.get_data()
+		tmp_filename = ""
+		if location is not None:
+			tmp_filename += location
+			tmp_filename += "/"
+		tmp_filename += "{}-{}-{}-{}-{}-{}-{}.txt".format(
+				self.durl.hostname, self.durl.username, self.durl.page_id, self.durl.rev,
+				self.date, self.changecheck, random_string() )
+		
+		verbose_write( 1, "tmp_filename = [{}]\n".format( tmp_filename ) )
+
+		return tmp_filename
+	
+	def tmp_file( self, *, location = None ):
+		page_data_bin = self.get_data( binary = True )
+		tmp_filename = self.tmp_filename( location = location )
+
+		fh = open( tmp_filename, mode = "bw", buffering = 0 );
+		fh.write( page_data_bin )
+		fh.close()
+
+		return tmp_filename
+	
+	def set_data( self, *, data = None, data_bin = None, filename = None, message = None, sync = True, update = False ):
+
+		verbose_write( 1, "filename = [{}]\n".format( filename ) )
+		verbose_write( 1, "message = [{}]\n".format( message ) )
+		verbose_write( 1, "sync = [{}]\n".format( sync ) )
+		verbose_write( 1, "update = [{}]\n".format( update ) )
+		verbose_write( 1, "rev = [{}] = [{}]\n".format( self.rev, self.durl.rev ) )
+
+		if ( not sync ) and ( not update ):
+			raise RuntimeError( "neither update nor sync is set..." )
+
+		if filename is not None:
+			fh = open( filename, mode = "br", buffering = 0 );
+			data_bin = fh.read()
+			fh.close()
+
+		if data is None and data_bin is not None:
+			data = data_bin.decode( "utf-8" );
+			
+		if data_bin is None and data is not None:
+			data_bin = data.encode( "utf-8" );
+
+		if sync:
+			
+			if self.durl.rev == 0:
+				self.get_data()
+				sha1 = hashlib.sha1( data_bin )
+				verbose_write( 1, "sha1 = [{}]\n".format( sha1 ) )
+				verbose_write( 1, "self.sha1 = [{}]\n".format( self.sha1 ) )
+				if sha1.digest() == self.sha1.digest():
+					verbose_write( 1, "no change in data ... returning\n".format( self.sha1 ) )
+					return
+				else:
+					verbose_write( 1, "data changed, updating ...\n".format( self.sha1 ) )
+					
+
+			self.page.set_data( data = data, data_bin = data_bin, message = message )
+		
+		if update:
+		
+			self.data = data
+			self.data_bin = data_bin
+
+		return
+			
+
+
+if ( __name__ == '__main__' ):
+
+	usage = "usage: %prog [options] command ..."
+
+	optparse.OptionParser.format_epilog = lambda self, formatter: self.epilog
+	option_parser = optparse.OptionParser( usage = usage, add_help_option = False, version="{} {}".format( program_name, program_version ) )
+	option_parser.epilog = (
+"""
+Commands:
+  dokuwiki-tool [options] cat url...
+                        pipe content to stdout ...
+  dokuwiki-tool [options] teq url...
+                        write stdin to url ...
+  dokuwiki-tool [options] edit url
+                        open url with $EDITOR ...
+
+Workflow example:
+  dokuwiki-tool -v -d -u ?username? -p ?password? login https://dokuwiki.concurrent.co.za/doku.php?id=sandbox
+  dokuwiki-tool -v -d -c edit https://dokuwiki.concurrent.co.za/doku.php?id=sandbox
+
+Notes:
+  * if you dont trust this tool dont use -c ... that way your changes are saved in directory that you ran this tool from.
+  * dont specify login/password after initial login inf cookie-jar is used.
+  * etc ...
+""")
+
+	option_parser.add_option( "-h", "--help", action="help" )
+	option_parser.add_option( "-v", "--verbose", action="count", dest="verbosity", help="increase verbosity level" )
+	option_parser.add_option( "-u", "--username", action="store", dest="username", help="Username for dokuwiki" )
+	option_parser.add_option( "-p", "--password", action="store", dest="password", help="Password for dokuwiki" )
+	option_parser.add_option( "-U", "--http-username", action="store", dest="http_username", help="Username for http" )
+	option_parser.add_option( "-P", "--http-password", action="store", dest="http_password", help="Password for http" )
+	option_parser.add_option( "-m", "--message", action="store", dest="message", help="Specify commit message" )
+	option_parser.add_option( "-e", "--editor", action="store", dest="editor", help="Specify editor" )
+	option_parser.add_option( "-c", "--cleanup", action="store_true", dest="cleanup", help="Cleanup files" )
+	option_parser.add_option( "-D", "--cookie-jar-file", action="store", dest="cookie_jar_file", help="Cookie jar file" )
+	option_parser.add_option( "-d", "--cookie-jar", action="store_true", dest="cookie_jar", help="Cookie jar" )
+
+	( options, args ) = option_parser.parse_args( args = sys.argv[1:] )
+
+	if ( options.verbosity is not None ):
+		if options.verbosity >= 5:
+			http.client.HTTPConnection.debuglevel = 1
+			http.client.HTTPSConnection.debuglevel = 1
+			
+		def verbose_write( level, string ):
+			if level <= options.verbosity:
+				## https://gist.github.com/techtonik/2151727
+				stack = inspect.stack()
+				parentframe = stack[ 1 ][ 0 ]
+				module = inspect.getmodule( parentframe )
+				module_name = ""
+				class_name = ""
+				if module:
+					module_name = module.__name__
+				if 'self' in parentframe.f_locals:
+					class_name = parentframe.f_locals['self'].__class__.__name__
+				code_name = parentframe.f_code.co_name;
+
+				sys.stderr.write( "{}::{}::{}[{}]:{}".format( module_name, class_name, code_name, parentframe.f_lineno, string ) )
+	else:
+		verbose_write = lambda *a: None
+	
+	verbose_write( 2, "os.environ.get( \"EDITOR\", None ) = [{}]\n".format( os.environ.get( "EDITOR", None ) ) )
+
+	if ( options.editor is None ) and ( "EDITOR" in os.environ ):
+		options.editor = os.environ[ "EDITOR" ]
+
+
+	home_dir = os.environ[ "HOME" ]
+
+	verbose_write( 1, "options.username = [{}]\n".format( options.username ) )
+	verbose_write( 1, "options.password = [{}]\n".format( options.password ) )
+	verbose_write( 1, "options.http_username = [{}]\n".format( options.http_username ) )
+	verbose_write( 1, "options.http_password = [{}]\n".format( options.http_password ) )
+	verbose_write( 1, "options.verbosity = [{}]\n".format( options.verbosity ) )
+	verbose_write( 1, "options.message = [{}]\n".format( options.message ) )
+	verbose_write( 1, "options.editor = [{}]\n".format( options.editor ) )
+	verbose_write( 1, "options.cleanup = [{}]\n".format( options.cleanup ) )
+	verbose_write( 1, "options.cookie_jar = [{}]\n".format( options.cookie_jar ) )
+	verbose_write( 1, "options.cookie_jar_file = [{}]\n".format( options.cookie_jar_file ) )
+	verbose_write( 1, "len( args ) = [{}]\n".format( len( args ) ) )
+
+	#if options.username is None:
+	#	sys.stderr.write( "no username \n".format() )
+	#	option_parser.print_help( sys.stderr )
+	#	raise SystemExit( 1 )
+
+	#if options.password is None:
+	#	sys.stderr.write( "no password \n".format() )
+	#	option_parser.print_help( sys.stderr )
+	#	raise SystemExit( 1 )
+
+	if len( args ) < 1:
+		sys.stderr.write( "no command specified\n".format() )
+		option_parser.print_help( sys.stderr )
+		raise SystemExit( 1 )
+
+	command = args[ 0 ];
+
+	cookie_jar_file = None
+
+	if ( options.cookie_jar_file is not None ):
+		cookie_jar_file = options.cookie_jar_file
+	elif ( options.cookie_jar is not None ) and options.cookie_jar:
+		cookie_jar_file = home_dir + "/.dokuwiki-tool.cookie.jar"
+	
+	verbose_write( 1, "cookie_jar_file = [{}]\n".format( cookie_jar_file ) )
+	
+	sites = DokuwikiSites(
+			username = options.username, password = options.password,
+			http_username = options.http_username, http_password = options.http_password,
+			cookie_file = cookie_jar_file )
+
+	if 1 == 0:
+		None
+	elif command == "cat":
+		for i in range( 1, len( args ) ):
+			verbose_write( 1, "cat args[ {} ] = {} \n".format( i, args[ i ] ) )
+			#durl = DokuwikiUrl( url )
+			#sys.stdout.write( sites.get_site( durl = durl ).get_page( durl = durl ).get_rev( durl = durl ).get_data() )
+			data = sites.get_page_rev( url = args[ i ] ).get_data()
+			sys.stdout.write( data )
+			if data[-1] != '\n':
+				sys.stdout.write( "\n" )
+	elif command == "login":
+		for i in range( 1, len( args ) ):
+			verbose_write( 1, "login args[ {} ] = {} \n".format( i, args[ i ] ) )
+			data = sites.get_site( url = args[ i ] ).login()
+			sys.stderr.write( "{}: logged in\n".format( args[ i ] ) )
+	elif command == "teq":
+		stdin_data = sys.stdin.read()
+		for i in range( 1, len( args ) ):
+			verbose_write( 1, "teq args[ {} ] = {} \n".format( i, args[ i ] ) )
+			sites.get_page( url = args[ i ] ).set_data( data = stdin_data, message = options.message )
+	elif command == "rm":
+		for i in range( 1, len( args ) ):
+			verbose_write( 1, "rm args[ {} ] = {} \n".format( i, args[ i ] ) )
+			sites.get_page( url = args[ i ] ).set_data( data = "", message = options.message )
+	elif command == "edit":
+		if len( args ) > 2:
+			sys.stderr.write( "too many parameters [ {} ] specified to command [ {} ]\n".format( len( args ) - 1, command ) )
+			option_parser.print_help( sys.stderr )
+			raise SystemExit( 1 )
+		verbose_write( 1, "edit args[ {} ] = {} \n".format( 1, args[ 1 ] ) )
+		page_rev = sites.get_page_rev( url = args[ 1 ] )
+		page_rev_filename = page_rev.tmp_file()
+		verbose_write( 1, "subprocess.call( [ {}, {} ] ) ...\n".format( options.editor, page_rev_filename ) )
+		rc = subprocess.call( [ options.editor, page_rev_filename ] )
+		verbose_write( 1, "rc = [{}]\n".format( rc ) )
+		if rc != 0:
+			sys.stderr.write( "subprocess.call( [ {}, {} ] ) ... failed [ rc = {} ]\n".format( options.editor, page_rev_filename, rc ) )
+			raise SystemExit( 1 )
+		page_rev.set_data( filename = page_rev_filename );
+		if ( options.cleanup is not None ) and options.cleanup:
+			sys.stderr.write( "cleaning up [ {} ]\n".format( page_rev_filename ) )
+			os.remove( page_rev_filename );
+	else:
+		sys.stderr.write( "invalid command specified [ command = {} ]\n".format( command ) )
+		option_parser.print_help( sys.stderr )
+		raise SystemExit( 1 )
