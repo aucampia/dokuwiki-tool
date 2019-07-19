@@ -76,7 +76,7 @@ touch README.md
 git init
 git add README.md
 git commit -m "first commit"
-git config user.email "aucampia@gmail.com"
+git config user.email "..."
 git config user.name "Iwan Aucamp"
 git remote add origin https://github.com/aucampia/dokuwiki-tool.git
 git push -u origin master
